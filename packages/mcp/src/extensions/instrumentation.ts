@@ -53,6 +53,7 @@ import {
   newSessionId,
   resolveSession,
 } from './session'
+import type { ResolvedSession } from './session'
 import {
   omitClientConversation,
   recognizeClient,
@@ -246,9 +247,7 @@ export async function captureToolCall(params: TraceToolCallParams): Promise<unkn
   try {
     result = await runInToolSession(data, preparedEvent, () => execute(downstreamRequest))
   } catch (error) {
-    if (preparedEvent && conversation.minted) {
-      preparedEvent.event.conversationId = undefined
-    }
+    dropUndeliveredHandle(preparedEvent)
     if (isUnknownTool) {
       publishUnknownToolEvent(server, preparedEvent, hostProperties, data.logger)
     } else {
@@ -257,7 +256,7 @@ export async function captureToolCall(params: TraceToolCallParams): Promise<unkn
     throw error
   }
 
-  const finalResult = applyConversationInstructions(preparedEvent?.event ?? null, result, conversation, ownership)
+  const finalResult = applyConversationInstructions(preparedEvent, result, conversation, ownership)
   if (isUnknownTool && isToolResultError(result)) {
     publishUnknownToolEvent(server, preparedEvent, hostProperties, data.logger)
   } else {
@@ -291,6 +290,22 @@ function resolveToolConversation(
 interface PreparedToolEvent {
   event: McpEvent
   requestAttribution: SessionInfo
+  /** Set when this call minted a handle: the session the event falls back to if the agent never receives it. */
+  sessionWithoutHandle?: ResolvedSession
+}
+
+/**
+ * A minted handle the agent never received groups nothing, so the event takes
+ * the session the call would have had without one.
+ */
+function dropUndeliveredHandle(preparedEvent: PreparedToolEvent | null): void {
+  const fallback = preparedEvent?.sessionWithoutHandle
+  if (!fallback) {
+    return
+  }
+  preparedEvent.event.conversationId = undefined
+  preparedEvent.event.sessionId = fallback.sessionId
+  preparedEvent.event.sessionSource = fallback.source
 }
 
 /**
@@ -388,6 +403,10 @@ async function prepareToolCallEvent(
       request,
       client
     )
+    // Resolved now, with the handle's, so both describe the call as it arrived.
+    const sessionWithoutHandle = conversation.minted
+      ? resolveSession(server, extra, undefined, request, client)
+      : undefined
     // Snapshot token/client/protocol metadata synchronously, before identify or
     // metadata callbacks can yield and let another request replace shared state.
     const sessionInfo = getSessionInfo(server, data, sessionId)
@@ -428,7 +447,7 @@ async function prepareToolCallEvent(
       const resolvedModel = resolveModel(request, ownership.read.llmModel)
       setEventModel(event, resolvedModel?.model, resolvedModel?.source)
     }
-    return { event, requestAttribution }
+    return { event, requestAttribution, sessionWithoutHandle }
   } catch (error) {
     data.logger(
       `Warning: PostHog MCP analytics instrumentation failed for tool ${request.params?.name}, the tool will still run - ${error}`
@@ -448,7 +467,7 @@ async function prepareToolCallEvent(
  * nobody has.
  */
 function applyConversationInstructions(
-  event: McpEvent | null,
+  preparedEvent: PreparedToolEvent | null,
   result: unknown,
   conversation: ConversationIdResolution,
   ownership: Pick<AnalyticsParameterOwnership, 'outputInstructions'>
@@ -473,8 +492,8 @@ function applyConversationInstructions(
   }
 
   // Only a minted session handle can be lost this way — one the agent supplied, it has.
-  if (!delivered && conversation.minted && event) {
-    event.conversationId = undefined
+  if (!delivered) {
+    dropUndeliveredHandle(preparedEvent)
   }
 
   return updated
